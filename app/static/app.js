@@ -11,6 +11,7 @@ const state = {
   stream: null,
   facing: "environment",
   estimate: null,
+  adviceLoading: false,
 };
 
 const video = $("#video");
@@ -146,6 +147,7 @@ function renderDate() {
   $("#summary-kicker").textContent = label;
   $("#log-for").textContent = label;
   $("#next-day").disabled = state.date >= todayISO();
+  renderAdviceButton();
 }
 
 function renderSummary() {
@@ -562,34 +564,102 @@ function fillSettingsForm() {
     daily_goal: 2000,
     model: "",
     model_is_custom: false,
-    inference: "openrouter",
+    default_model: "google/gemini-2.5-flash",
+    openrouter: true,
     estimates_ready: false,
+    setup_detail: "Set API_KEY before using the model.",
   };
-  const local = settings.inference === "local";
+  const fallback = settings.default_model || "";
   $("#goal-input").value = settings.daily_goal;
   $("#model-input").value = settings.model_is_custom ? settings.model : "";
-  $("#model-input").placeholder = settings.model || (local ? "vision model name" : "google/gemini-2.5-flash");
-  $("#model-label").textContent = local ? "Model" : "OpenRouter model";
-  $("#model-hint").textContent = local
-    ? "Leave the model blank to use LOCAL_MODEL. It has to accept images."
-    : "Leave the model blank to use OPENROUTER_MODEL from the server. It has to accept images.";
-  if (settings.inference !== "openrouter" && settings.inference !== "local") {
-    $("#banner-detail").textContent = "Set INFERENCE to openrouter or local, then restart.";
-    $("#key-status").textContent = "INFERENCE must be openrouter or local.";
-  } else if (local) {
-    $("#banner-detail").textContent = "Set LOCAL_BASE_URL and LOCAL_MODEL, then restart. You can still log meals by hand.";
-    $("#key-status").textContent = settings.estimates_ready
-      ? "Using a local OpenAI-compatible server."
-      : "No local endpoint configured yet.";
+  $("#model-input").placeholder = fallback || "vision model name";
+  $("#model-label").textContent = "Model";
+  if (fallback) {
+    $("#model-hint").textContent = `Leave this blank to use ${fallback}. It has to accept images.`;
   } else {
-    $("#banner-detail").textContent = "Add OPENROUTER_API_KEY and restart. You can still log meals by hand.";
-    $("#key-status").textContent = settings.estimates_ready
-      ? "OpenRouter key is set on the server."
-      : "No OpenRouter key on the server yet.";
+    $("#model-hint").textContent = "Type a vision model, or set MODEL on the server.";
   }
-  const via = local ? "local" : "OpenRouter";
-  $("#model-note").textContent = settings.model ? `Estimating with ${settings.model} via ${via}` : "";
+  if (settings.estimates_ready) {
+    $("#key-status").textContent = settings.openrouter ? "Using OpenRouter." : "Using your model server.";
+  } else {
+    const detail = settings.setup_detail || "The model is not configured yet.";
+    $("#banner-detail").textContent = `${detail} You can still log meals by hand.`;
+    $("#key-status").textContent = detail;
+  }
+  const via = settings.openrouter ? " via OpenRouter" : "";
+  $("#model-note").textContent = settings.estimates_ready && settings.model
+    ? `Estimating with ${settings.model}${via}`
+    : "";
   $("#key-banner").hidden = Boolean(settings.estimates_ready);
+  renderAdviceButton();
+}
+
+function renderAdviceButton() {
+  const button = $("#advice-btn");
+  if (!button) return;
+  const ready = Boolean(state.settings && state.settings.estimates_ready);
+  button.hidden = state.date !== todayISO();
+  button.disabled = state.adviceLoading || !ready;
+  button.textContent = state.adviceLoading ? "Thinking…" : "What to eat";
+  button.title = ready ? "Ideas for the calories left today" : "The model is not configured yet.";
+}
+
+function renderAdviceLoading() {
+  $("#advice-body").replaceChildren(
+    el("div", { class: "advice-loading" }, [
+      el("span", { class: "spinner", "aria-hidden": "true" }),
+      el("p", {}, "Looking at today's log…"),
+    ]),
+  );
+}
+
+function renderAdvice(advice) {
+  const bits = [];
+  if (advice.summary) bits.push(el("p", { class: "advice-summary" }, advice.summary));
+  (advice.ideas || []).forEach((idea) => {
+    bits.push(el("div", { class: "advice-idea" }, [
+      el("div", { class: "advice-idea-top" }, [
+        el("h3", {}, idea.title),
+        el("p", { class: "advice-kcal num" }, [fmt(idea.calories), el("span", { class: "advice-unit" }, "kcal")]),
+      ]),
+      idea.detail ? el("p", { class: "advice-detail" }, idea.detail) : null,
+    ]));
+  });
+  if (!bits.length) bits.push(el("p", { class: "advice-summary" }, "No suggestion came back. Try again."));
+  bits.push(el("p", { class: "hint" }, "A suggestion from the model, not a dietitian."));
+  $("#advice-body").replaceChildren(...bits);
+}
+
+async function askAdvice() {
+  if (state.adviceLoading || state.date !== todayISO()) return;
+  if (!state.settings || !state.settings.estimates_ready) {
+    toast("The model is not configured yet.", "error");
+    return;
+  }
+  state.adviceLoading = true;
+  renderAdviceButton();
+  openDialog("#advice-dialog");
+  renderAdviceLoading();
+  const again = $("#advice-again");
+  again.disabled = true;
+  try {
+    const advice = await api("/api/advice", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        date: state.date,
+        local_time: new Date().toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }),
+        timezone_offset_minutes: new Date().getTimezoneOffset(),
+      }),
+    });
+    renderAdvice(advice);
+  } catch (error) {
+    $("#advice-body").replaceChildren(el("p", { class: "advice-summary" }, error.message));
+  } finally {
+    state.adviceLoading = false;
+    renderAdviceButton();
+    again.disabled = false;
+  }
 }
 
 async function saveSettings(event) {
@@ -657,6 +727,8 @@ $("#shutter").addEventListener("click", takePhoto);
 $("#retake").addEventListener("click", resetCapture);
 $("#estimate").addEventListener("click", estimate);
 $("#open-manual").addEventListener("click", () => openDialog("#manual-dialog"));
+$("#advice-btn").addEventListener("click", askAdvice);
+$("#advice-again").addEventListener("click", askAdvice);
 $("#settings-form").addEventListener("submit", saveSettings);
 $("#manual-form").addEventListener("submit", saveManual);
 fileInput.addEventListener("change", async () => {
@@ -691,6 +763,7 @@ window.addEventListener("hashchange", () => {
 
 bindDialog($("#settings-dialog"));
 bindDialog($("#manual-dialog"));
+bindDialog($("#advice-dialog"));
 
 state.date = readHash();
 if (location.hash !== `#${state.date}`) history.replaceState(null, "", `#${state.date}`);

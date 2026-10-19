@@ -112,9 +112,9 @@ def daily_goal() -> int:
 
 
 def default_model() -> str:
-    if os.environ.get("INFERENCE", "openrouter").strip().lower() == "local":
-        return os.environ.get("LOCAL_MODEL", "").strip()
-    return os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash").strip() or "google/gemini-2.5-flash"
+    from app.estimator import get_provider
+
+    return get_provider().default_model
 
 
 def configured_model() -> str:

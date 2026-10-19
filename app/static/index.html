@@ -42,8 +42,8 @@
     </header>
 
     <div id="key-banner" class="banner" hidden>
-      <strong>Photo estimates are off.</strong>
-      <span id="banner-detail">Add OPENROUTER_API_KEY and restart. You can still log meals by hand.</span>
+      <strong>The model is off.</strong>
+      <span id="banner-detail">Set API_KEY and restart. You can still log meals by hand.</span>
     </div>
 
     <div class="layout">
@@ -56,7 +56,10 @@
               <p class="kcal-caption">kcal</p>
             </div>
             <p class="remain num" id="remain">Loading the log…</p>
-            <button type="button" class="goal-link" id="open-goal">Goal 2,000</button>
+            <div class="summary-actions">
+              <button type="button" class="goal-link" id="open-goal">Goal 2,000</button>
+              <button type="button" class="advice-link" id="advice-btn" hidden>What to eat</button>
+            </div>
             <dl class="macros" id="macros"></dl>
           </div>
           <svg class="ring" viewBox="0 0 120 120" aria-hidden="true">
@@ -142,10 +145,10 @@
         <input id="goal-input" name="daily_goal" type="number" min="800" max="8000" step="50" inputmode="numeric" required>
       </label>
       <label class="field">
-        <span id="model-label">OpenRouter model</span>
+        <span id="model-label">Model</span>
         <input id="model-input" name="model" type="text" maxlength="120" spellcheck="false" autocomplete="off" placeholder="google/gemini-2.5-flash">
       </label>
-      <p class="hint" id="model-hint">Leave the model blank to use OPENROUTER_MODEL from the server. It has to accept images.</p>
+      <p class="hint" id="model-hint">Leave this blank to use the model from the server. It has to accept images.</p>
       <p class="hint" id="key-status"></p>
       <div class="action-row">
         <button type="button" class="btn btn-ghost" data-close>Cancel</button>
@@ -178,6 +181,20 @@
         <button type="submit" class="btn btn-primary">Log meal</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="advice-dialog">
+    <div class="sheet advice-sheet">
+      <div class="panel-head">
+        <h2>Rest of the day</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close">×</button>
+      </div>
+      <div id="advice-body"></div>
+      <div class="action-row">
+        <button type="button" class="btn btn-ghost" data-close>Close</button>
+        <button type="button" class="btn btn-primary" id="advice-again">Ask again</button>
+      </div>
+    </div>
   </dialog>
 
   <div id="toasts" aria-live="polite"></div>

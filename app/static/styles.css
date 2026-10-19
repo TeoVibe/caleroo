@@ -175,6 +175,7 @@ h2 {
   text-transform: uppercase;
 }
 .remain { margin: 8px 0 0; font-size: 1.05rem; font-weight: 550; }
+.summary-actions { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
 .goal-link {
   margin-top: 2px;
   padding: 0;
@@ -182,6 +183,14 @@ h2 {
   font-weight: 600;
 }
 .goal-link:hover { text-decoration: underline; }
+.advice-link {
+  margin-top: 2px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-weight: 600;
+}
+.advice-link:hover { color: var(--lime); }
 .macros {
   display: flex;
   gap: 22px;
@@ -428,6 +437,34 @@ dialog { padding: 0; border: 0; background: transparent; }
 dialog::backdrop { background: rgba(0, 0, 0, 0.62); backdrop-filter: blur(8px); }
 .macro-fields { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .sheet .icon-btn { border: 0; font-size: 1.4rem; }
+.advice-sheet {
+  width: min(520px, calc(100vw - 32px));
+  max-height: min(640px, calc(100vh - 48px));
+  overflow: auto;
+}
+.advice-loading { display: flex; align-items: center; gap: 12px; min-height: 72px; }
+.advice-loading p { margin: 0; font-weight: 600; }
+.advice-summary {
+  margin: 4px 0 6px;
+  font-family: var(--serif);
+  font-size: 1.35rem;
+  letter-spacing: -0.03em;
+  line-height: 1.25;
+}
+.advice-idea { padding: 12px 0; border-top: 1px dashed rgba(244, 245, 239, 0.14); }
+.advice-idea-top { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.advice-idea h3 { margin: 0; font-size: 1.02rem; font-weight: 600; font-family: var(--sans); letter-spacing: 0; }
+.advice-kcal { margin: 0; font-family: var(--serif); font-size: 1.35rem; letter-spacing: -0.03em; white-space: nowrap; }
+.advice-unit {
+  margin-left: 4px;
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.advice-detail { margin: 4px 0 0; color: var(--muted); }
 
 #toasts {
   position: fixed;

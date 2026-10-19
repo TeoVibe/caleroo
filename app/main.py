@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -15,7 +14,18 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import db
-from app.estimator import EstimatorError, estimate_calories, estimates_ready, inference_mode, sniff_image, sum_items
+from app.estimator import (
+    EstimatorError,
+    advise_rest_of_day,
+    close_client,
+    configure,
+    estimate_calories,
+    get_provider,
+    open_client,
+    sniff_image,
+    sum_items,
+    unavailable_reason,
+)
 
 logger = logging.getLogger("caleroo")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -24,9 +34,18 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    provider = configure()
     db.init()
-    logger.info("ready inference=%s model=%s", inference_mode(), db.configured_model() or "unset")
-    yield
+    await open_client()
+    logger.info(
+        "ready provider=%s model=%s",
+        provider.name,
+        db.configured_model() or "unset",
+    )
+    try:
+        yield
+    finally:
+        await close_client()
 
 
 app = FastAPI(title="Caleroo", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -53,13 +72,17 @@ def health() -> dict:
 
 @app.get("/api/settings")
 def get_settings() -> dict:
+    provider = get_provider()
+    model = db.configured_model()
+    reason = unavailable_reason(model)
     return {
         "daily_goal": db.daily_goal(),
-        "model": db.configured_model(),
+        "model": model,
         "model_is_custom": db.model_is_custom(),
-        "inference": inference_mode(),
-        "estimates_ready": estimates_ready() and bool(db.configured_model()),
-        "api_key_set": bool(os.environ.get("OPENROUTER_API_KEY")),
+        "default_model": provider.default_model,
+        "openrouter": provider.openrouter,
+        "estimates_ready": not reason,
+        "setup_detail": reason,
     }
 
 
@@ -103,10 +126,42 @@ def get_week(day: str) -> dict:
     return {"end": parsed.isoformat(), "goal": db.daily_goal(), "days": db.week_ending(parsed)}
 
 
+def _require_configured() -> str:
+    model = db.configured_model()
+    reason = unavailable_reason(model)
+    if reason:
+        raise HTTPException(
+            status_code=503,
+            detail=f"{reason} You can still log meals by hand.",
+        )
+    return model
+
+
+@app.post("/api/advice")
+async def advice(request: Request) -> dict:
+    model = _require_configured()
+    data = await _json_object(request)
+    day = _parse_day(str(data.get("date") or "")).isoformat()
+    local_time = _clean(data.get("local_time"), 32)
+    context = _advice_context(day, local_time, _offset_minutes(data.get("timezone_offset_minutes")))
+    started = time.perf_counter()
+    try:
+        result = await advise_rest_of_day(context, model=model)
+    except EstimatorError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    logger.info(
+        "advice %.1fs model=%s ideas=%s",
+        time.perf_counter() - started,
+        model,
+        len(result["ideas"]),
+    )
+    return result
+
+
 @app.post("/api/analyze")
 async def analyze(request: Request) -> dict:
     image, media_type = await _read_upload(request, field="image")
-    model = db.configured_model()
+    model = _require_configured()
     started = time.perf_counter()
     try:
         estimate = await estimate_calories(image, media_type, model=model)
@@ -130,23 +185,26 @@ async def create_meal(request: Request) -> dict:
         data = await _json_object(request)
     else:
         form = await request.form()
-        raw = form.get("payload")
-        if not isinstance(raw, str) or not raw.strip():
-            raise HTTPException(status_code=400, detail="Missing meal details.")
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Meal details were not valid JSON.") from None
-        if not isinstance(data, dict):
-            raise HTTPException(status_code=400, detail="Meal details must be an object.")
-        upload = form.get("image")
-        if upload is not None and hasattr(upload, "read"):
-            image_bytes = await upload.read()
-            media_type = sniff_image(image_bytes)
-            if media_type is None:
-                raise HTTPException(status_code=400, detail="Use a JPEG, PNG, WebP, or GIF photo.")
-            if len(image_bytes) > MAX_IMAGE_BYTES:
-                raise HTTPException(status_code=413, detail="That photo is larger than 8 MB.")
+            raw = form.get("payload")
+            if not isinstance(raw, str) or not raw.strip():
+                raise HTTPException(status_code=400, detail="Missing meal details.")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                raise HTTPException(status_code=400, detail="Meal details were not valid JSON.") from None
+            if not isinstance(data, dict):
+                raise HTTPException(status_code=400, detail="Meal details must be an object.")
+            upload = form.get("image")
+            if upload is not None and hasattr(upload, "read"):
+                image_bytes = await upload.read()
+                media_type = sniff_image(image_bytes)
+                if media_type is None:
+                    raise HTTPException(status_code=400, detail="Use a JPEG, PNG, WebP, or GIF photo.")
+                if len(image_bytes) > MAX_IMAGE_BYTES:
+                    raise HTTPException(status_code=413, detail="That photo is larger than 8 MB.")
+        finally:
+            await form.close()
     meal = _meal_from_client(data)
     image_name = None
     if image_bytes is not None and media_type is not None:
@@ -275,6 +333,80 @@ def _meal_from_client(data: dict) -> dict:
     }
 
 
+def _offset_minutes(value) -> int | None:
+    try:
+        offset = int(value)
+    except (TypeError, ValueError):
+        return None
+    if offset < -840 or offset > 840:
+        return None
+    return offset
+
+
+def _grams(value) -> str:
+    number = float(value)
+    if number == int(number):
+        return str(int(number))
+    return f"{number:.1f}"
+
+
+def _meal_clock(created_at: str, offset: int | None) -> str:
+    if offset is None or not created_at:
+        return ""
+    try:
+        stamp = datetime.fromisoformat(created_at)
+    except ValueError:
+        return ""
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    local = stamp - timedelta(minutes=offset)
+    hour = local.hour
+    suffix = "AM" if hour < 12 else "PM"
+    hour12 = hour % 12 or 12
+    return f"{hour12}:{local.minute:02d} {suffix}"
+
+
+def _advice_context(day: str, local_time: str, offset: int | None) -> str:
+    meals = list(reversed(db.meals_on(day)))
+    totals = _totals(meals)
+    goal = db.daily_goal()
+    remaining = goal - totals["calories"]
+    if remaining >= 0:
+        left = f"{remaining} kcal still available"
+    else:
+        left = f"{abs(remaining)} kcal over the goal"
+    lines = [
+        f"Local time: {local_time or 'unknown'}",
+        f"Daily calorie goal: {goal}",
+        (
+            f"Eaten so far: {totals['calories']} kcal "
+            f"(protein {_grams(totals['protein_g'])} g, carbs {_grams(totals['carbs_g'])} g, "
+            f"fat {_grams(totals['fat_g'])} g)"
+        ),
+        left,
+        "",
+    ]
+    if not meals:
+        lines.append("Meals today: none logged yet.")
+        return "\n".join(lines)
+    lines.append("Meals today:")
+    for meal in meals[:16]:
+        when = _meal_clock(meal["created_at"], offset)
+        prefix = f"{when}, " if when else ""
+        names = [
+            item.get("name", "")
+            for item in (meal.get("items") or [])[:8]
+            if isinstance(item, dict) and item.get("name") and item.get("name") != meal["title"]
+        ]
+        foods = f" Foods: {', '.join(names)}." if names else ""
+        lines.append(
+            f"- {prefix}{meal['title']}: {meal['calories']} kcal "
+            f"(protein {_grams(meal['protein_g'])} g, carbs {_grams(meal['carbs_g'])} g, "
+            f"fat {_grams(meal['fat_g'])} g).{foods}"
+        )
+    return "\n".join(lines)
+
+
 def _totals(meals: list[dict]) -> dict:
     return {
         "calories": sum(meal["calories"] for meal in meals),
@@ -296,15 +428,18 @@ async def _json_object(request: Request) -> dict:
 
 async def _read_upload(request: Request, field: str) -> tuple[bytes, str]:
     form = await request.form()
-    upload = form.get(field)
-    if upload is None or not hasattr(upload, "read"):
-        raise HTTPException(status_code=400, detail="Choose a photo first.")
-    data = await upload.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="That photo was empty.")
-    if len(data) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="That photo is larger than 8 MB.")
-    media_type = sniff_image(data)
-    if media_type is None:
-        raise HTTPException(status_code=400, detail="Use a JPEG, PNG, WebP, or GIF photo.")
-    return data, media_type
+    try:
+        upload = form.get(field)
+        if upload is None or not hasattr(upload, "read"):
+            raise HTTPException(status_code=400, detail="Choose a photo first.")
+        data = await upload.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="That photo was empty.")
+        if len(data) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="That photo is larger than 8 MB.")
+        media_type = sniff_image(data)
+        if media_type is None:
+            raise HTTPException(status_code=400, detail="Use a JPEG, PNG, WebP, or GIF photo.")
+        return data, media_type
+    finally:
+        await form.close()

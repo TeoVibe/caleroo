@@ -10,12 +10,9 @@ services:
     environment:
       PORT: "6969"
       DATA_DIR: /data
-      INFERENCE: ${INFERENCE:-openrouter}
-      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
-      LOCAL_BASE_URL: ${LOCAL_BASE_URL:-}
-      LOCAL_MODEL: ${LOCAL_MODEL:-}
-      LOCAL_API_KEY: ${LOCAL_API_KEY:-}
+      BASE_URL: ${BASE_URL:-}
+      API_KEY: ${API_KEY:-}
+      MODEL: ${MODEL:-}
       APP_URL: ${APP_URL:-http://localhost:6969}
     extra_hosts:
       - "host.docker.internal:host-gateway"

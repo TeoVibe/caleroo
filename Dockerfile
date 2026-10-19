@@ -13,7 +13,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-RUN mkdir -p /data
+RUN groupadd --gid 1000 caleroo \
+    && useradd --uid 1000 --gid 1000 --no-create-home caleroo \
+    && mkdir -p /data \
+    && chown caleroo:caleroo /data
+
+USER caleroo
 
 EXPOSE 6969
 
