@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.formparsers import MultiPartException
 
 from app import db
+from app.auth import AVATARS, SESSION_COOKIE, SESSION_DAYS, authentication_enabled, hash_password
 from app.estimator import (
     EstimatorError,
     advise_rest_of_day,
@@ -30,6 +33,23 @@ from app.estimator import (
 logger = logging.getLogger("caleroo")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_BODY_BYTES = 12 * 1024 * 1024
+_LOGIN_WINDOW = 600.0
+_LOGIN_LIMIT = 8
+_login_hits: dict[str, list[float]] = {}
+_login_lock = threading.Lock()
+_CSP = (
+    "default-src 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'; "
+    "object-src 'none'; "
+    "script-src 'self' 'sha256-IYBTGH2y6PdjINiXpNJbvpAKWjsccwQdl/dhZDeNkjk='; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; "
+    "img-src 'self' data:; "
+    "connect-src 'self'"
+)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -38,9 +58,10 @@ async def lifespan(_app: FastAPI):
     db.init()
     await open_client()
     logger.info(
-        "ready provider=%s model=%s",
+        "ready provider=%s model=%s auth=%s",
         provider.name,
         db.configured_model() or "unset",
+        authentication_enabled(),
     )
     try:
         yield
@@ -52,12 +73,80 @@ app = FastAPI(title="Caleroo", docs_url=None, redoc_url=None, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+def _open_path(path: str) -> bool:
+    if path == "/" or path.startswith("/static/") or path == "/favicon.ico":
+        return True
+    return path in {"/api/health", "/api/auth", "/api/register", "/api/login", "/api/logout"}
+
+
+def _attach_user(request: Request):
+    if not authentication_enabled() or request.url.path.startswith("/static/"):
+        request.state.user = None
+        return db.set_scope(None)
+    token = request.cookies.get(SESSION_COOKIE)
+    user = db.user_from_token(token) if token else None
+    request.state.user = user
+    return db.set_scope(user["id"] if user else 0)
+
+
+def _body_too_large(request: Request) -> bool:
+    raw = request.headers.get("content-length")
+    if not raw:
+        return False
+    try:
+        size = int(raw)
+    except ValueError:
+        return False
+    return size > MAX_BODY_BYTES
+
+
+def _client_host(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _login_limited(host: str) -> bool:
+    now = time.monotonic()
+    with _login_lock:
+        recent = [stamp for stamp in _login_hits.get(host, []) if now - stamp < _LOGIN_WINDOW]
+        _login_hits[host] = recent
+        return len(recent) >= _LOGIN_LIMIT
+
+
+def _note_login_failure(host: str) -> None:
+    now = time.monotonic()
+    with _login_lock:
+        recent = [stamp for stamp in _login_hits.get(host, []) if now - stamp < _LOGIN_WINDOW]
+        recent.append(now)
+        _login_hits[host] = recent
+
+
+def _clear_login_failures(host: str) -> None:
+    with _login_lock:
+        _login_hits.pop(host, None)
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    return response
+    scope_token = _attach_user(request)
+    try:
+        if _body_too_large(request):
+            response = JSONResponse({"detail": "Request is too large."}, status_code=413)
+        elif authentication_enabled() and request.state.user is None and not _open_path(request.url.path):
+            response = JSONResponse({"detail": "Log in first."}, status_code=401)
+        else:
+            response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = _CSP
+        response.headers["Permissions-Policy"] = "camera=(self), microphone=(), geolocation=()"
+        if request.url.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+        elif request.url.path.startswith("/api/") and "cache-control" not in response.headers:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+    finally:
+        db.reset_scope(scope_token)
 
 
 @app.get("/")
@@ -70,25 +159,164 @@ def health() -> dict:
     return {"ok": True}
 
 
+def _client_user(user: dict | None) -> dict | None:
+    if not user:
+        return None
+    return {"username": user["username"], "avatar": user["avatar"]}
+
+
+def _auth_body(user: dict | None = None) -> dict:
+    enabled = authentication_enabled()
+    body = {"authentication": enabled, "user": _client_user(user)}
+    if enabled:
+        body["avatars"] = list(AVATARS)
+        body["has_users"] = db.has_users()
+    return body
+
+
+def _cookie_secure(request: Request) -> bool:
+    return request.url.scheme == "https"
+
+
+def _set_session_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_DAYS * 24 * 60 * 60,
+        httponly=True,
+        samesite="lax",
+        path="/",
+        secure=_cookie_secure(request),
+    )
+
+
+def _clear_session_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        SESSION_COOKIE,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=_cookie_secure(request),
+    )
+
+
+def _require_auth_enabled() -> None:
+    if not authentication_enabled():
+        raise HTTPException(status_code=404, detail="Logins are off.")
+
+
+def _clean_name(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _username(value) -> str:
+    name = _clean_name(value)
+    if not name:
+        raise HTTPException(status_code=400, detail="Enter a name.")
+    if len(name) > 24:
+        raise HTTPException(status_code=400, detail="Use a name up to 24 characters.")
+    if not all(char.isalpha() or char.isdigit() or char in " '-" for char in name):
+        raise HTTPException(status_code=400, detail="Use letters and numbers in the name.")
+    return name
+
+
+def _password(value) -> str:
+    password = "" if value is None else str(value)
+    if len(password) > 200 or len(password.strip()) < 6:
+        raise HTTPException(status_code=400, detail="Use a password of at least 6 characters.")
+    return password
+
+
+def _avatar(value) -> str:
+    avatar = str(value or "").strip().lower()
+    if avatar not in AVATARS:
+        raise HTTPException(status_code=400, detail="Pick an avatar.")
+    return avatar
+
+
+@app.get("/api/auth")
+def get_auth(request: Request) -> dict:
+    return _auth_body(request.state.user)
+
+
+@app.post("/api/register")
+async def register(request: Request, response: Response) -> dict:
+    _require_auth_enabled()
+    data = await _json_object(request)
+    username = _username(data.get("username"))
+    password = _password(data.get("password"))
+    avatar = _avatar(data.get("avatar"))
+    goals = _goal_numbers(data, required=True)
+    try:
+        user = db.create_user(username, hash_password(password), avatar)
+    except ValueError:
+        raise HTTPException(status_code=409, detail="That name is taken.") from None
+    db.set_scope(user["id"])
+    request.state.user = user
+    for key, amount in goals.items():
+        db.set_setting(key, str(amount))
+    _set_session_cookie(response, request, db.create_session(user["id"]))
+    return _auth_body(user)
+
+
+@app.post("/api/login")
+async def login(request: Request, response: Response) -> dict:
+    _require_auth_enabled()
+    host = _client_host(request)
+    if _login_limited(host):
+        raise HTTPException(status_code=429, detail="Too many attempts. Wait a few minutes.")
+    data = await _json_object(request)
+    user = db.authenticate(
+        _clean_name(data.get("username")),
+        "" if data.get("password") is None else str(data.get("password")),
+    )
+    if user is None:
+        _note_login_failure(host)
+        raise HTTPException(status_code=401, detail="That name or password is wrong.")
+    _clear_login_failures(host)
+    db.set_scope(user["id"])
+    request.state.user = user
+    _set_session_cookie(response, request, db.create_session(user["id"]))
+    return _auth_body(user)
+
+
+@app.post("/api/logout")
+def logout(request: Request, response: Response) -> dict:
+    _require_auth_enabled()
+    db.delete_session(request.cookies.get(SESSION_COOKIE))
+    _clear_session_cookie(response, request)
+    return {"ok": True}
+
+
 @app.get("/api/settings")
-def get_settings() -> dict:
+def get_settings(request: Request) -> dict:
     provider = get_provider()
     model = db.configured_model()
     reason = unavailable_reason(model)
+    macros = db.macro_goals()
     return {
         "daily_goal": db.daily_goal(),
+        "protein_goal": macros["protein_g"],
+        "carbs_goal": macros["carbs_g"],
+        "fat_goal": macros["fat_g"],
         "model": model,
         "model_is_custom": db.model_is_custom(),
         "default_model": provider.default_model,
         "openrouter": provider.openrouter,
         "estimates_ready": not reason,
         "setup_detail": reason,
+        "theme": db.theme(),
+        "authentication": authentication_enabled(),
+        "user": _client_user(request.state.user),
     }
 
 
-@app.put("/api/settings")
-async def put_settings(request: Request) -> dict:
-    data = await _json_object(request)
+def _goal_numbers(data: dict, required: bool = False) -> dict:
+    if required:
+        missing = [key for key in ("daily_goal", "protein_goal", "carbs_goal", "fat_goal") if key not in data]
+        if missing:
+            raise HTTPException(status_code=400, detail="Set a diet, protein, carbs, and fat goal.")
+    goals = {}
     if "daily_goal" in data:
         try:
             goal = int(data["daily_goal"])
@@ -96,7 +324,41 @@ async def put_settings(request: Request) -> dict:
             raise HTTPException(status_code=400, detail="Daily goal must be a whole number.") from None
         if goal < 800 or goal > 8000:
             raise HTTPException(status_code=400, detail="Keep the daily goal between 800 and 8000 kcal.")
-        db.set_setting("daily_goal", str(goal))
+        goals["daily_goal"] = goal
+    for key, label, low, high in (
+        ("protein_goal", "Protein", 10, 400),
+        ("carbs_goal", "Carbs", 10, 800),
+        ("fat_goal", "Fat", 10, 300),
+    ):
+        if key not in data:
+            continue
+        try:
+            amount = int(data[key])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{label} goal must be a whole number.") from None
+        if amount < low or amount > high:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Keep the {label.lower()} goal between {low} and {high} g.",
+            )
+        goals[key] = amount
+    return goals
+
+
+def _store_goals(data: dict) -> None:
+    for key, amount in _goal_numbers(data).items():
+        db.set_setting(key, str(amount))
+
+
+@app.put("/api/settings")
+async def put_settings(request: Request) -> dict:
+    data = await _json_object(request)
+    chosen_theme = None
+    if "theme" in data:
+        chosen_theme = str(data.get("theme") or "").strip().lower()
+        if chosen_theme not in db.THEMES:
+            raise HTTPException(status_code=400, detail="That theme is not available.")
+    _store_goals(data)
     if "model" in data:
         model = " ".join(str(data["model"] or "").split())
         if model and not _valid_model(model):
@@ -105,7 +367,9 @@ async def put_settings(request: Request) -> dict:
                 detail="Use a model name without spaces.",
             )
         db.set_setting("model", model)
-    return get_settings()
+    if chosen_theme is not None:
+        db.set_setting("theme", chosen_theme)
+    return get_settings(request)
 
 
 @app.get("/api/days/{day}")
@@ -115,6 +379,7 @@ def get_day(day: str) -> dict:
     return {
         "date": parsed.isoformat(),
         "goal": db.daily_goal(),
+        "macro_goals": db.macro_goals(),
         "totals": _totals(meals),
         "meals": meals,
     }
@@ -123,7 +388,17 @@ def get_day(day: str) -> dict:
 @app.get("/api/weeks/{day}")
 def get_week(day: str) -> dict:
     parsed = _parse_day(day)
-    return {"end": parsed.isoformat(), "goal": db.daily_goal(), "days": db.week_ending(parsed)}
+    return {
+        "end": parsed.isoformat(),
+        "goal": db.daily_goal(),
+        "macro_goals": db.macro_goals(),
+        "days": db.week_ending(parsed),
+    }
+
+
+@app.get("/api/history")
+def get_history() -> dict:
+    return db.history()
 
 
 def _require_configured() -> str:
@@ -132,7 +407,7 @@ def _require_configured() -> str:
     if reason:
         raise HTTPException(
             status_code=503,
-            detail=f"{reason} You can still log meals by hand.",
+            detail=reason,
         )
     return model
 
@@ -184,7 +459,7 @@ async def create_meal(request: Request) -> dict:
     if "application/json" in content_type:
         data = await _json_object(request)
     else:
-        form = await request.form()
+        form = await _form(request)
         try:
             raw = form.get("payload")
             if not isinstance(raw, str) or not raw.strip():
@@ -222,7 +497,7 @@ async def create_meal(request: Request) -> dict:
 @app.delete("/api/meals/{meal_id}")
 def remove_meal(meal_id: int) -> dict:
     if not db.delete_meal(meal_id):
-        raise HTTPException(status_code=404, detail="That meal is no longer in the log.")
+        raise HTTPException(status_code=404, detail="That meal is not in the log.")
     return {"ok": True}
 
 
@@ -366,10 +641,22 @@ def _meal_clock(created_at: str, offset: int | None) -> str:
     return f"{hour12}:{local.minute:02d} {suffix}"
 
 
+def _macro_status(goals: dict, totals: dict) -> str:
+    bits = []
+    for key, label in (("protein_g", "protein"), ("carbs_g", "carbs"), ("fat_g", "fat")):
+        left = goals[key] - float(totals[key])
+        if left >= 0:
+            bits.append(f"{label} {_grams(left)} g left")
+        else:
+            bits.append(f"{label} {_grams(abs(left))} g over")
+    return "Macros: " + ", ".join(bits) + "."
+
+
 def _advice_context(day: str, local_time: str, offset: int | None) -> str:
     meals = list(reversed(db.meals_on(day)))
     totals = _totals(meals)
     goal = db.daily_goal()
+    macros = db.macro_goals()
     remaining = goal - totals["calories"]
     if remaining >= 0:
         left = f"{remaining} kcal still available"
@@ -379,11 +666,16 @@ def _advice_context(day: str, local_time: str, offset: int | None) -> str:
         f"Local time: {local_time or 'unknown'}",
         f"Daily calorie goal: {goal}",
         (
+            f"Macro goals: protein {macros['protein_g']} g, "
+            f"carbs {macros['carbs_g']} g, fat {macros['fat_g']} g"
+        ),
+        (
             f"Eaten so far: {totals['calories']} kcal "
             f"(protein {_grams(totals['protein_g'])} g, carbs {_grams(totals['carbs_g'])} g, "
             f"fat {_grams(totals['fat_g'])} g)"
         ),
         left,
+        _macro_status(macros, totals),
         "",
     ]
     if not meals:
@@ -426,8 +718,15 @@ async def _json_object(request: Request) -> dict:
     return data
 
 
+async def _form(request: Request):
+    try:
+        return await request.form(max_files=2, max_fields=8, max_part_size=MAX_IMAGE_BYTES)
+    except MultiPartException:
+        raise HTTPException(status_code=413, detail="That upload is larger than 8 MB.") from None
+
+
 async def _read_upload(request: Request, field: str) -> tuple[bytes, str]:
-    form = await request.form()
+    form = await _form(request)
     try:
         upload = form.get(field)
         if upload is None or not hasattr(upload, "read"):

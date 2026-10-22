@@ -1,8 +1,8 @@
 # Caleroo
 
-A simple AI-powered calorie counter. Photograph a plate, or upload one, and a vision model estimates the foods. Correct the numbers, then keep them in a daily log with calories, protein, carbs, and fat. You can also add a meal by hand, set a daily goal, and look back over the last seven days. On today, **What to eat** asks the same model what still fits the calories you have left.
+A simple AI-powered calorie counter. Photograph a plate, or upload one, and a vision model estimates the foods. Correct the numbers, then keep them in a daily log with calories, protein, carbs, and fat. You can also add a meal by hand, set daily goals for calories, protein, carbs, and fat, and look back over the last seven days. On today, **What to eat** asks the same model what still fits the calories and macros you have left.
 
-It is a small self-hosted web app. There is no account. Meals and photos stay in a `data/` directory on the machine running it.
+It is a small self-hosted web app. By default there is no account: one shared log, and nobody logs in. Set `AUTHENTICATION=true` when more than one person should keep a separate log. Meals and photos stay in a `data/` directory on the machine running it.
 
 A photo estimate is sent to whichever model server you configure. That server sees the image. Meal advice sends that day’s log: titles, calories, macros, and the time of day. It does not send photos. Logging a meal by hand does not send anything.
 
@@ -24,7 +24,7 @@ docker compose up -d --force-recreate
 
 That reloads configuration. It does not delete the log.
 
-You can also change the model and the daily goal in the app. A model typed there overrides `MODEL`. Leave that field blank to use the value from `.env` again.
+You can also change the model and the daily goals in the app. A model typed there overrides `MODEL`. Leave that field blank to use the value from `.env` again.
 
 ## Estimates
 
@@ -56,6 +56,7 @@ Docker Compose reads `.env` and passes these into the container.
 | `API_KEY` | Bearer token. Required for OpenRouter. Optional for a server that does not check one. |
 | `MODEL` | Model name. Empty on OpenRouter uses `google/gemini-2.5-flash`. Your own server needs a vision model here, or one set in the app. |
 | `APP_URL` | Sent to OpenRouter as the `HTTP-Referer` header so the request is attributed to this app. Defaults to `http://localhost:6969`. |
+| `AUTHENTICATION` | `false` (the default) is one shared log with no login. `true` asks each person to register. They choose a password, starting calorie and macro goals, and an avatar. Each account then has its own meals and goals. |
 
 Two more are set by Compose itself, in `docker-compose.yml`:
 
@@ -66,13 +67,13 @@ Two more are set by Compose itself, in `docker-compose.yml`:
 
 ## Data
 
-Meals and photos persist in `data/` (`caleroo.sqlite` and `images/`). Docker bind-mounts that directory, and it is gitignored. Deleting those files clears the log. The container runs as user id 1000, so that directory stays owned by the usual login on this machine.
+Meals and photos persist in `data/` (`caleroo.sqlite` and `images/`). Docker bind-mounts that directory, and it is gitignored. Deleting those files clears the log. With accounts on, each person has their own meals, photos, and goals in that same database. The container runs as user id 1000, so that directory stays owned by the usual login on this machine.
 
 ## Notes
 
 The camera needs a secure page (`localhost` or HTTPS). Uploading a photo works from any address you can reach, including another device on your network.
 
-Do not publish port 6969 to the internet. Anyone who can open the app can use your API key, or your model server.
+Do not publish port 6969 to the internet. Anyone who can open the app can use your API key, or your model server. With `AUTHENTICATION=true`, anyone who can open the page can also create an account.
 
 ## Without Docker
 

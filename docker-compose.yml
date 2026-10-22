@@ -14,6 +14,7 @@ services:
       API_KEY: ${API_KEY:-}
       MODEL: ${MODEL:-}
       APP_URL: ${APP_URL:-http://localhost:6969}
+      AUTHENTICATION: ${AUTHENTICATION:-false}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

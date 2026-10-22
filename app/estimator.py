@@ -426,10 +426,10 @@ Reply with one JSON object and no other text:
 
 Rules:
 - Give 2 or 3 concrete ideas that fit the calories still available.
+- Also fit the protein, carb, and fat still left of each goal in the log. Prefer foods that fill a macro that is behind, and do not build an idea around a macro that is already met or over.
 - Use ordinary foods, and match the time of day.
-- The only target is the calorie goal. Do not invent protein or macro targets.
 - If little room is left, suggest a small snack, or say they can stop.
-- If they are already over the goal, do not push more food. Say so, and offer one light option only if they might still be hungry.
+- If they are already over the calorie goal, do not push more food. Say so, and offer one light option only if they might still be hungry.
 - If nothing is logged yet, suggest a simple plan for the meals still ahead today.
 - calories is an integer estimate for that idea.
 - This is practical meal planning, not medical advice. Do not diagnose or recommend extreme restriction.

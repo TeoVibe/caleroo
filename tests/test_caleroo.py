@@ -28,7 +28,7 @@ from app.estimator import (  # noqa: E402
     load_provider,
     normalize_estimate,
 )
-from app.main import app  # noqa: E402
+from app.main import _advice_context, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 
@@ -254,6 +254,7 @@ class WebTests(unittest.TestCase):
         os.environ["MODEL"] = values.get("MODEL", "")
         os.environ["APP_URL"] = "http://localhost:6969"
         os.environ["DATA_DIR"] = TMP
+        os.environ["AUTHENTICATION"] = values.get("AUTHENTICATION", "false")
 
     def test_settings_use_openrouter_by_default(self):
         self._env()
@@ -266,8 +267,10 @@ class WebTests(unittest.TestCase):
         self.assertEqual(body["model"], "google/gemini-2.5-flash")
         self.assertEqual(body["default_model"], "google/gemini-2.5-flash")
         self.assertEqual(body["setup_detail"], "")
+        self.assertEqual(body["theme"], "lime")
         self.assertNotIn("inference", body)
-        self.assertIn("Set API_KEY", page)
+        self.assertNotIn("Set API_KEY", page)
+        self.assertNotIn("by hand", page)
         self.assertNotIn("INFERENCE", page)
         self.assertNotIn("OPENROUTER_API_KEY", page)
 
@@ -285,7 +288,8 @@ class WebTests(unittest.TestCase):
         self.assertIn("API_KEY", settings["setup_detail"])
         self.assertEqual(bad.status_code, 400)
         self.assertEqual(photo.status_code, 503)
-        self.assertIn("by hand", photo.json()["detail"])
+        self.assertIn("API_KEY", photo.json()["detail"])
+        self.assertNotIn("by hand", photo.json()["detail"])
         self.assertEqual(advice.status_code, 503)
 
     def test_own_server_is_ready_with_a_model_and_no_key(self):
@@ -309,3 +313,314 @@ class WebTests(unittest.TestCase):
         self._env()
         with TestClient(app) as client:
             self.assertEqual(client.get("/api/health").json(), {"ok": True})
+
+    def test_history_groups_days_from_the_first_meal(self):
+        self._env()
+        with TestClient(app) as client:
+            empty = client.get("/api/history").json()
+            client.post("/api/meals", json={"eaten_on": "2026-10-18", "title": "Soup", "calories": 180})
+            client.post("/api/meals", json={"eaten_on": "2026-10-02", "title": "Toast", "calories": 200})
+            client.post("/api/meals", json={"eaten_on": "2026-10-02", "title": "Eggs", "calories": 150})
+            body = client.get("/api/history").json()
+        self.assertIsNone(empty["first"])
+        self.assertEqual(empty["days"], [])
+        self.assertEqual(body["first"], "2026-10-02")
+        self.assertEqual(body["goal"], 2000)
+        self.assertEqual(
+            [(day["date"], day["calories"], day["meals"]) for day in body["days"]],
+            [("2026-10-02", 350, 2), ("2026-10-18", 180, 1)],
+        )
+
+    def test_theme_round_trip(self):
+        self._env()
+        with TestClient(app) as client:
+            bad = client.put("/api/settings", json={"theme": "glare", "daily_goal": 2200})
+            kept = client.get("/api/settings").json()
+            saved = client.put("/api/settings", json={"theme": "Ink"}).json()
+        self.assertEqual(bad.status_code, 400)
+        self.assertEqual(kept["theme"], "lime")
+        self.assertEqual(kept["daily_goal"], 2000)
+        self.assertEqual(saved["theme"], "ink")
+
+    def test_page_has_calendar_and_themes(self):
+        self._env()
+        with TestClient(app) as client:
+            page = client.get("/").text
+        self.assertIn("calendar-dialog", page)
+        self.assertIn("theme-picker", page)
+        self.assertIn("caleroo-theme", page)
+        self.assertIn("protein-goal-input", page)
+        self.assertIn("carbs-goal-input", page)
+        self.assertIn("fat-goal-input", page)
+        self.assertIn("ring-protein", page)
+        self.assertIn("ring-carbs", page)
+        self.assertIn("ring-fat", page)
+        self.assertIn("register-form", page)
+        self.assertIn("avatar-picker", page)
+        self.assertNotIn("open-workout", page)
+        self.assertNotIn("workout-dialog", page)
+
+    def test_macro_goals_show_up_with_the_day(self):
+        self._env()
+        from app import db
+
+        meal_id = None
+        try:
+            with TestClient(app) as client:
+                bad = client.put("/api/settings", json={"protein_goal": 2, "carbs_goal": "nope", "fat_goal": 900})
+                kept = client.get("/api/settings").json()
+                saved = client.put(
+                    "/api/settings",
+                    json={"protein_goal": 160, "carbs_goal": 180, "fat_goal": 50},
+                ).json()
+                meal = client.post(
+                    "/api/meals",
+                    json={
+                        "eaten_on": "2026-09-11",
+                        "title": "Rice",
+                        "calories": 900,
+                        "protein_g": 30,
+                        "carbs_g": 40,
+                        "fat_g": 10,
+                    },
+                )
+                meal_id = meal.json()["id"]
+                day = client.get("/api/days/2026-09-11").json()
+                week = client.get("/api/weeks/2026-09-11").json()
+                gone = client.post("/api/workouts", json={"done_on": "2026-09-11", "calories": 200})
+            self.assertEqual(bad.status_code, 400)
+            self.assertEqual(kept["daily_goal"], 2000)
+            self.assertEqual(kept["protein_goal"], 150)
+            self.assertEqual(kept["carbs_goal"], 200)
+            self.assertEqual(kept["fat_goal"], 65)
+            self.assertEqual(saved["protein_goal"], 160)
+            self.assertEqual(saved["carbs_goal"], 180)
+            self.assertEqual(saved["fat_goal"], 50)
+            self.assertEqual(saved["daily_goal"], 2000)
+            self.assertEqual(day["goal"], 2000)
+            self.assertEqual(day["macro_goals"], {"protein_g": 160, "carbs_g": 180, "fat_g": 50})
+            self.assertEqual(day["totals"]["calories"], 900)
+            self.assertEqual(day["totals"]["protein_g"], 30)
+            self.assertEqual(day["totals"]["carbs_g"], 40)
+            self.assertEqual(day["totals"]["fat_g"], 10)
+            self.assertNotIn("workouts", day)
+            self.assertNotIn("burned", day)
+            self.assertEqual(week["macro_goals"], day["macro_goals"])
+            self.assertNotIn("workout_goal", week)
+            logged = next(item for item in week["days"] if item["date"] == "2026-09-11")
+            self.assertEqual((logged["protein_g"], logged["carbs_g"], logged["fat_g"]), (30, 40, 10))
+            self.assertNotIn("burned", logged)
+            self.assertEqual(gone.status_code, 404)
+        finally:
+            if meal_id is not None:
+                db.delete_meal(meal_id)
+            with db.connect() as conn:
+                conn.execute(
+                    "DELETE FROM settings WHERE key IN ('protein_goal', 'carbs_goal', 'fat_goal')"
+                )
+
+    def test_advice_context_includes_macro_goals(self):
+        self._env()
+        from app import db
+
+        previous = db.get_setting("daily_goal")
+        db.set_setting("daily_goal", "2000")
+        db.set_setting("protein_goal", "150")
+        db.set_setting("carbs_goal", "200")
+        db.set_setting("fat_goal", "65")
+        meal_id = None
+        try:
+            with TestClient(app) as client:
+                meal = client.post(
+                    "/api/meals",
+                    json={
+                        "eaten_on": "2026-08-20",
+                        "title": "Toast",
+                        "calories": 400,
+                        "protein_g": 12,
+                        "carbs_g": 40,
+                        "fat_g": 8,
+                    },
+                )
+                meal_id = meal.json()["id"]
+                text = _advice_context("2026-08-20", "1:00 PM", 0)
+            self.assertIn("Macro goals: protein 150 g, carbs 200 g, fat 65 g", text)
+            self.assertIn("1600 kcal still available", text)
+            self.assertIn("protein 138 g left", text)
+            self.assertIn("carbs 160 g left", text)
+            self.assertIn("fat 57 g left", text)
+            self.assertNotIn("burned", text)
+            self.assertNotIn("Workout", text)
+        finally:
+            if meal_id is not None:
+                db.delete_meal(meal_id)
+            if previous is None:
+                with db.connect() as conn:
+                    conn.execute("DELETE FROM settings WHERE key = ?", ("daily_goal",))
+            else:
+                db.set_setting("daily_goal", previous)
+            with db.connect() as conn:
+                conn.execute(
+                    "DELETE FROM settings WHERE key IN ('protein_goal', 'carbs_goal', 'fat_goal')"
+                )
+
+    def test_accounts_are_optional_and_keep_separate_logs(self):
+        self._env()
+        from app import db
+
+        legacy_id = None
+        ada_ids = []
+        try:
+            with TestClient(app) as shared:
+                off = shared.get("/api/auth").json()
+                blocked = shared.post("/api/register", json={"username": "Ada", "password": "secret1"})
+                legacy = shared.post(
+                    "/api/meals",
+                    json={"eaten_on": "2026-07-04", "title": "Shared", "calories": 50},
+                )
+                legacy_id = legacy.json()["id"]
+            self.assertFalse(off["authentication"])
+            self.assertIsNone(off["user"])
+            self.assertNotIn("avatars", off)
+            self.assertEqual(blocked.status_code, 404)
+
+            os.environ["AUTHENTICATION"] = "true"
+            goals = {
+                "daily_goal": 2000,
+                "protein_goal": 150,
+                "carbs_goal": 200,
+                "fat_goal": 65,
+            }
+            with TestClient(app) as anon, TestClient(app) as ada, TestClient(app) as bo:
+                opening = anon.get("/api/auth").json()
+                locked = anon.get("/api/days/2026-07-04")
+                health = anon.get("/api/health")
+                short = anon.post(
+                    "/api/register",
+                    json={"username": "Ada", "password": "no", "avatar": "lemon", **goals},
+                )
+                bad_face = anon.post(
+                    "/api/register",
+                    json={"username": "Ada", "password": "secret1", "avatar": "wizard", **goals},
+                )
+                created = ada.post(
+                    "/api/register",
+                    json={
+                        "username": "Ada",
+                        "password": "secret1",
+                        "avatar": "fox",
+                        "daily_goal": 1800,
+                        "protein_goal": 120,
+                        "carbs_goal": 160,
+                        "fat_goal": 50,
+                    },
+                )
+                duplicate = anon.post(
+                    "/api/register",
+                    json={"username": "ada", "password": "secret1", "avatar": "cat", **goals},
+                )
+                other = bo.post(
+                    "/api/register",
+                    json={
+                        "username": "Bo",
+                        "password": "secret2",
+                        "avatar": "panda",
+                        "daily_goal": 2200,
+                        "protein_goal": 160,
+                        "carbs_goal": 210,
+                        "fat_goal": 70,
+                    },
+                )
+                ada_meal = ada.post(
+                    "/api/meals",
+                    json={"eaten_on": "2026-07-04", "title": "Ada rice", "calories": 300, "protein_g": 10},
+                )
+                photo = ada.post(
+                    "/api/meals",
+                    data={
+                        "payload": json.dumps(
+                            {
+                                "eaten_on": "2026-07-04",
+                                "title": "Ada plate",
+                                "calories": 100,
+                                "protein_g": 5,
+                            }
+                        )
+                    },
+                    files={"image": ("meal.jpg", b"\xff\xd8\xff\x00", "image/jpeg")},
+                )
+                if ada_meal.status_code == 200:
+                    ada_ids.append(ada_meal.json()["id"])
+                if photo.status_code == 200:
+                    ada_ids.append(photo.json()["id"])
+                ada_day = ada.get("/api/days/2026-07-04").json()
+                bo_day = bo.get("/api/days/2026-07-04").json()
+                ada_settings = ada.get("/api/settings").json()
+                bo_settings = bo.get("/api/settings").json()
+                ada.put("/api/settings", json={"theme": "ink"})
+                bo_theme = bo.get("/api/settings").json()["theme"]
+                stolen = bo.delete(f"/api/meals/{ada_meal.json()['id']}")
+                hidden = bo.get(f"/api/meals/{photo.json()['id']}/image")
+                seen = ada.get(f"/api/meals/{photo.json()['id']}/image")
+                wrong = anon.post("/api/login", json={"username": "Ada", "password": "nope"})
+                logged = anon.post("/api/login", json={"username": "ada", "password": "secret1"})
+                bye = anon.post("/api/logout")
+                after = anon.get("/api/days/2026-07-04")
+                bo_still = bo.get("/api/days/2026-07-04")
+                with db.connect() as conn:
+                    ada_id = conn.execute(
+                        "SELECT id FROM users WHERE username = ?",
+                        ("Ada",),
+                    ).fetchone()["id"]
+                scope = db.set_scope(ada_id)
+                try:
+                    text = _advice_context("2026-07-04", "1:00 PM", 0)
+                finally:
+                    db.reset_scope(scope)
+
+            self.assertTrue(opening["authentication"])
+            self.assertFalse(opening["has_users"])
+            self.assertIn("fox", opening["avatars"])
+            self.assertEqual(locked.status_code, 401)
+            self.assertEqual(health.json(), {"ok": True})
+            self.assertEqual(short.status_code, 400)
+            self.assertEqual(bad_face.status_code, 400)
+            self.assertEqual(created.status_code, 200)
+            self.assertIn("httponly", created.headers["set-cookie"].lower())
+            self.assertEqual(created.json()["user"], {"username": "Ada", "avatar": "fox"})
+            self.assertNotIn("password_hash", created.text)
+            self.assertEqual(duplicate.status_code, 409)
+            self.assertEqual(other.status_code, 200)
+            self.assertEqual(ada_settings["daily_goal"], 1800)
+            self.assertEqual(ada_settings["protein_goal"], 120)
+            self.assertEqual(ada_settings["user"]["avatar"], "fox")
+            self.assertEqual(bo_settings["daily_goal"], 2200)
+            self.assertEqual(bo_settings["protein_goal"], 160)
+            self.assertEqual(bo_theme, "lime")
+            self.assertEqual(ada_day["totals"]["calories"], 400)
+            self.assertEqual(sorted(meal["title"] for meal in ada_day["meals"]), ["Ada plate", "Ada rice"])
+            self.assertEqual(bo_day["totals"]["calories"], 0)
+            self.assertEqual(bo_day["meals"], [])
+            self.assertEqual(stolen.status_code, 404)
+            self.assertEqual(hidden.status_code, 404)
+            self.assertEqual(seen.status_code, 200)
+            self.assertEqual(wrong.status_code, 401)
+            self.assertEqual(logged.status_code, 200)
+            self.assertEqual(bye.status_code, 200)
+            self.assertEqual(after.status_code, 401)
+            self.assertEqual(bo_still.status_code, 200)
+            self.assertIn("Ada rice", text)
+            self.assertIn("Daily calorie goal: 1800", text)
+            self.assertIn("1400 kcal still available", text)
+            self.assertNotIn("Shared", text)
+        finally:
+            os.environ["AUTHENTICATION"] = "false"
+            db.set_scope(None)
+            if legacy_id is not None:
+                db.delete_meal(legacy_id)
+            for meal_id in ada_ids:
+                db.delete_meal(meal_id)
+            with db.connect() as conn:
+                conn.execute("DELETE FROM sessions")
+                conn.execute("DELETE FROM users")
+                conn.execute("DELETE FROM settings WHERE key GLOB '[0-9]*:*'")
